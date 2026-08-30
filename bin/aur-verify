@@ -1,0 +1,528 @@
+#!/usr/bin/env bash
+# aur-verify: heuristic safety check for installed AUR packages.
+#
+# What this does NOT do: prove a PKGBUILD is safe. AUR has no vetting —
+# that's the actual threat model. What it DOES do, automatically:
+#   1. Pulls AUR metadata in one batched RPC call (votes, popularity,
+#      orphan status, out-of-date, package age) and flags weak signals.
+#   2. Detects MAINTAINER CHANGES since your last run — account takeover
+#      and adoption-then-poisoning of orphans is the classic AUR
+#      supply-chain vector.
+#   3. Clones the FULL AUR git repo (pkgbase-aware, so split packages
+#      work) and scans EVERY file — not just PKGBUILD/.install — for
+#      known malicious-shell patterns, split into high-confidence and
+#      context-dependent tiers, with file:line evidence.
+#   4. Flags binary blobs committed to the AUR repo, suspiciously long
+#      base64-ish lines (obfuscated payloads), SKIP checksums on
+#      non-VCS sources, and any NEW source domain vs. your last run
+#      (the 2025 incidents delivered payloads via changed source URLs).
+#   5. Diffs the whole repo tree against your last verified baseline.
+#      A SUSPICIOUS package's baseline is never auto-updated, so a
+#      re-run can't launder a flagged change into "no change".
+#   6. Records the verified git commit and cross-checks it against your
+#      AUR helper's cached clone (paru/yay), so you know if the helper
+#      would build something other than what you just verified.
+#   7. UPSTREAM artifact checks (catching a swapped binary behind a
+#      legitimate-looking URL):
+#        a. Checksums changed while pkgver AND source array stayed
+#           identical -> the artifact was silently replaced upstream.
+#        b. GitHub release assets modified AFTER publication (the
+#           classic post-release binary swap), via the GitHub API.
+#        c. Cooling-off: warns when the upstream artifact is younger
+#           than AUR_VERIFY_COOLOFF_HOURS (default 48) — most binary
+#           swaps are caught and pulled within a day or two; don't be
+#           the early adopter.
+#        d. Source domains that match neither the project homepage nor
+#           well-known hosting (reported once, when first seen).
+#      Set GITHUB_TOKEN to raise GitHub API rate limits (60/h without).
+#
+# Exit status: 0 clean, 1 if anything was flagged SUSPICIOUS — so you
+# can gate upgrades:  aur-verify -u && paru -Sua
+#
+# A clean report means "no red flags found by these checks," not
+# "guaranteed safe." Anything flagged deserves an actual look.
+#
+# Usage:
+#   aur-verify [-u] [pkg...]     check all foreign pkgs (or just pkg...)
+#   aur-verify --diff <pkgbase>  show diff between previous and current
+#                                verified versions of a package's repo
+#     -u, --upgradable           only check packages with a newer AUR ver
+set -euo pipefail
+
+CACHE_DIR="${AUR_VERIFY_CACHE:-$HOME/.cache/aur-verify}"
+AUR_RPC="https://aur.archlinux.org/rpc/v5/info"
+COOLOFF_HOURS="${AUR_VERIFY_COOLOFF_HOURS:-48}"
+mkdir -p "$CACHE_DIR"
+
+if [[ -t 1 ]]; then
+  RED=$'\e[31m'; YEL=$'\e[33m'; GRN=$'\e[32m'; BOLD=$'\e[1m'; RST=$'\e[0m'
+else
+  RED=""; YEL=""; GRN=""; BOLD=""; RST=""
+fi
+
+die() { echo "${RED}error:${RST} $*" >&2; exit 2; }
+
+for cmd in curl jq git vercmp timeout; do
+  command -v "$cmd" >/dev/null || die "missing dependency: $cmd"
+done
+
+# ---------------------------------------------------------------- patterns
+# High confidence: essentially no legitimate reason to appear in an AUR
+# repo. Any hit -> SUSPICIOUS.
+PATTERNS_HIGH=(
+  'curl[^|]*\|\s*(sudo\s+)?(ba|z|da)?sh'
+  'wget[^|]*\|\s*(sudo\s+)?(ba|z|da)?sh'
+  'base64\s+(-d|--decode)[^|]*\|\s*(sudo\s+)?(ba|z|da)?sh'
+  '/dev/tcp/'
+  '\bnc\s+(-[a-z]*e|.*-e\s)'
+  'bash\s+-i\s+>&'
+  '\bmkfifo\b.*\b(nc|ncat|sh)\b'
+  'discord(app)?\.com/api/webhooks'
+  'api\.telegram\.org/bot'
+  'pastebin\.com/raw'
+  '\btransfer\.sh\b'
+  '(bit\.ly|tinyurl\.com|goo\.gl|is\.gd|rb\.gy|t\.ly)/'
+  'https?://[0-9]{1,3}(\.[0-9]{1,3}){3}'
+  'authorized_keys'
+  'ld\.so\.preload'
+  '/etc/sudoers'
+  '\$\{IFS\}'
+  'history\s+-c'
+  '>>?\s*~?/?\.bashrc'
+  '>>?\s*~?/?\.bash_profile'
+  '>>?\s*~?/?\.profile'
+  '>>?\s*~?/?\.zshrc'
+)
+# Context-dependent: legitimate uses exist, but worth eyeballing.
+# Hits -> WATCH (unless a high hit already made it SUSPICIOUS).
+PATTERNS_MED=(
+  'base64\s+(-d|--decode)'
+  'eval\s+["$]'
+  '\bxxd\s+-r'
+  '\bopenssl\s+enc\s+-d'
+  'crontab\s+-'
+  'systemctl\s+enable.*--now'
+  '\.config/autostart'
+  'chmod\s+\+x\s+.*(/tmp|/dev/shm)'
+  '(/tmp|/dev/shm)/[^ "]+\.(sh|py|pl|elf|bin)'
+  'chmod\s+([0-7])?[24][0-7]{3}\b'
+  'chmod\s+.*\b[ug]\+s\b'
+  'python[0-9.]*\s+-c\s'
+  'perl\s+-e\s'
+  '\bsetsid\b'
+  '\bnohup\b'
+  'printf\s+.*\\\\x[0-9a-fA-F]{2}'
+  'wget\s+-q.*-O\s*-'
+  'curl\s+-s\S*\s.*-o\s*-'
+)
+
+# Hosting domains that legitimately differ from a project's homepage.
+KNOWN_HOSTS=(github.com githubusercontent.com gitlab.com sourceforge.net
+  pythonhosted.org npmjs.org crates.io codeberg.org bitbucket.org
+  launchpad.net gnome.org kde.org kernel.org gnu.org freedesktop.org)
+
+# ------------------------------------------------- PKGBUILD textual parsing
+# NEVER source a PKGBUILD — that executes it. Best-effort text extraction:
+# simple scalar assignments are collected and substituted into source URLs;
+# anything left unresolved is skipped rather than guessed.
+declare -A PBVARS
+pb_load_vars() { # $1 = PKGBUILD path
+  PBVARS=([CARCH]=x86_64 [arch]=x86_64)
+  local line k v
+  while IFS= read -r line; do
+    k=${line%%=*}; v=${line#*=}
+    v=${v%\"}; v=${v#\"}; v=${v%\'}; v=${v#\'}
+    [[ "$v" == *'$('* || "$v" == *'`'* ]] && continue
+    PBVARS[$k]=$v
+  done < <(grep -E "^[A-Za-z_][A-Za-z0-9_]*=[^ ()]*$" "$1" 2>/dev/null || true)
+}
+pb_expand() { # $1 = string containing $var / ${var} references
+  local s="$1" k
+  for k in "${!PBVARS[@]}"; do
+    s=${s//"\${$k}"/"${PBVARS[$k]}"}
+    s=${s//"\$$k"/"${PBVARS[$k]}"}
+  done
+  # best-effort on modified expansions like ${CARCH/arm64/aarch64}: use the
+  # plain value, ignoring the modifier; unknown vars stay and get dropped
+  while [[ "$s" =~ \$\{([A-Za-z_][A-Za-z0-9_]*)[^}]*\} ]]; do
+    k="${BASH_REMATCH[1]}"
+    [[ -v "PBVARS[$k]" ]] || break
+    s=${s/"${BASH_REMATCH[0]}"/"${PBVARS[$k]}"}
+  done
+  printf '%s' "$s"
+}
+pb_source_urls() { # $1 = PKGBUILD; prints expanded, non-VCS https URLs
+  # only the generic and x86_64 source arrays — no wrong-arch assets;
+  # expand variables FIRST: URLs are often built as "$url/releases/..."
+  awk '/^source(_x86_64)?=\(/{f=1} f{print; if (/\)/) f=0}' "$1" \
+    | while IFS= read -r u; do pb_expand "$u"; printf '\n'; done \
+    | grep -oE '(git\+|hg\+|svn\+|bzr\+)?https?://[^"'"'"')	 ]+' \
+    | grep -vE '^(git|hg|svn|bzr)\+' \
+    | grep -E '^https?://' | grep -Fv '$' | sort -u || true
+}
+regdom() { # crude registrable domain: last two labels
+  awk -F. '{ if (NF>=2) print $(NF-1)"."$NF; else print $0 }' <<< "$1"
+}
+
+# ---------------------------------------------------------------- args
+upgradable_only=0
+diff_pkg=""
+pkgs_arg=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -u|--upgradable) upgradable_only=1 ;;
+    --diff) shift; [[ $# -gt 0 ]] || die "--diff needs a pkgbase"; diff_pkg="$1" ;;
+    -h|--help) sed -n '2,/^set -euo/p' "$0" | head -n -1 | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -*) die "unknown option: $1" ;;
+    *) pkgs_arg+=("$1") ;;
+  esac
+  shift
+done
+
+if [[ -n "$diff_pkg" ]]; then
+  d="$CACHE_DIR/$diff_pkg"
+  [[ -d "$d/prev" ]] || die "no previous version stored for '$diff_pkg' (nothing changed yet, or wrong pkgbase)"
+  diff -ru --color=auto "$d/prev" "$d/current" || true
+  exit 0
+fi
+
+# ---------------------------------------------------------------- pkg list
+declare -A inst_ver
+pkgs=()
+if [[ ${#pkgs_arg[@]} -gt 0 ]]; then
+  pkgs=("${pkgs_arg[@]}")
+  for p in "${pkgs[@]}"; do
+    v=$(pacman -Q "$p" 2>/dev/null | awk '{print $2}') || true
+    [[ -n "${v:-}" ]] && inst_ver[$p]=$v
+  done
+else
+  while read -r name ver; do
+    [[ "$name" == *-debug ]] && continue
+    pkgs+=("$name"); inst_ver[$name]=$ver
+  done < <(pacman -Qm)
+fi
+[[ ${#pkgs[@]} -gt 0 ]] || die "no foreign packages found"
+
+echo "${BOLD}Checking ${#pkgs[@]} AUR package(s)...${RST}"
+
+# ---------------------------------------------------------------- batch RPC
+tmp_root=$(mktemp -d)
+trap 'rm -rf "$tmp_root"' EXIT
+rpc_json="$tmp_root/rpc.json"
+
+: > "$tmp_root/rpc_parts"
+i=0
+while [[ $i -lt ${#pkgs[@]} ]]; do
+  chunk=("${pkgs[@]:$i:100}")
+  curl_args=()
+  for n in "${chunk[@]}"; do curl_args+=(--data-urlencode "arg[]=$n"); done
+  if ! curl -fsS -G --max-time 30 "$AUR_RPC" "${curl_args[@]}" >> "$tmp_root/rpc_parts"; then
+    die "could not reach AUR RPC — refusing to report anything as OK without data"
+  fi
+  echo >> "$tmp_root/rpc_parts"
+  i=$((i+100))
+done
+jq -s '{results: (map(.results) | add)}' "$tmp_root/rpc_parts" > "$rpc_json"
+
+# ---------------------------------------------------------------- group by pkgbase
+declare -A base_of
+while read -r name base; do
+  base_of[$name]=$base
+done < <(jq -r '.results[] | "\(.Name) \(.PackageBase)"' "$rpc_json")
+
+declare -A base_names seen_base
+bases=()
+not_found=()
+for p in "${pkgs[@]}"; do
+  b="${base_of[$p]:-}"
+  if [[ -z "$b" ]]; then
+    not_found+=("$p")
+    continue
+  fi
+  if [[ -z "${seen_base[$b]:-}" ]]; then
+    seen_base[$b]=1; bases+=("$b")
+  fi
+  base_names[$b]+=" $p"
+done
+
+for p in "${not_found[@]}"; do
+  echo "${YEL}? ${p}: not on AUR (built locally, renamed, or DELETED — deletion after compromise happens; verify manually)${RST}"
+done
+echo
+
+# ---------------------------------------------------------------- per-base check
+flagged_count=0
+changed_count=0
+now=$(date +%s)
+
+for base in "${bases[@]}"; do
+  meta=$(jq -r --arg b "$base" \
+    '[.results[] | select(.PackageBase==$b)][0] |
+     "\(.NumVotes)\t\(.Popularity)\t\(.OutOfDate)\t\(.Maintainer)\t\(.FirstSubmitted)\t\(.LastModified)\t\(.Version)\t\(.URL)"' \
+    "$rpc_json")
+  IFS=$'\t' read -r votes popularity outofdate maintainer firstsub lastmod rpc_ver homepage <<< "$meta"
+
+  # upgrade status (per pkgname; use the first installed one we know)
+  upgrade_note=""
+  has_update=0
+  for n in ${base_names[$base]}; do
+    iv="${inst_ver[$n]:-}"
+    [[ -n "$iv" ]] || continue
+    if [[ $(vercmp "$rpc_ver" "$iv") -gt 0 ]]; then
+      has_update=1; upgrade_note="update available: ${iv} → ${rpc_ver}"
+    fi
+    break
+  done
+  if [[ $upgradable_only -eq 1 && $has_update -eq 0 ]]; then
+    continue
+  fi
+
+  pkg_cache="$CACHE_DIR/$base"
+  mkdir -p "$pkg_cache"
+  # migrate pre-2026 cache layout (files directly in the pkg dir)
+  if [[ ! -d "$pkg_cache/current" && -f "$pkg_cache/PKGBUILD" ]]; then
+    mkdir -p "$pkg_cache/current"
+    for f in "$pkg_cache"/*; do
+      [[ -f "$f" && "$f" != *.prev ]] && mv "$f" "$pkg_cache/current/"
+    done
+    rm -f "$pkg_cache"/*.prev
+  fi
+
+  risk_notes=()
+  [[ "$maintainer" == "null" || -z "$maintainer" ]] && risk_notes+=("orphaned (no maintainer)")
+  [[ "$votes" != "null" && "$votes" -lt 5 ]] && risk_notes+=("low votes ($votes)")
+  [[ "$outofdate" != "null" ]] && risk_notes+=("flagged out-of-date")
+  if [[ "$firstsub" != "null" ]]; then
+    age_days=$(( (now - firstsub) / 86400 ))
+    [[ $age_days -lt 30 ]] && risk_notes+=("package is only ${age_days}d old")
+  fi
+  if [[ "$lastmod" != "null" ]]; then
+    mod_hours=$(( (now - lastmod) / 3600 ))
+    [[ $mod_hours -lt 72 ]] && risk_notes+=("modified ${mod_hours}h ago — very fresh, extra scrutiny warranted")
+  fi
+
+  # maintainer change since last verified run — the takeover signal
+  if [[ -f "$pkg_cache/meta.json" ]]; then
+    prev_maint=$(jq -r '.maintainer // ""' "$pkg_cache/meta.json")
+    if [[ -n "$prev_maint" && "$prev_maint" != "$maintainer" ]]; then
+      risk_notes+=("MAINTAINER CHANGED: '${prev_maint}' → '${maintainer}' — classic takeover signal, review everything")
+    fi
+  fi
+
+  # ------------------------------------------------ clone full repo
+  repo="$tmp_root/repo"
+  rm -rf "$repo"
+  if ! GIT_TERMINAL_PROMPT=0 timeout 60 git clone -q --depth 1 \
+       "https://aur.archlinux.org/${base}.git" "$repo" 2>/dev/null; then
+    echo "${BOLD}${base}${RST} — ${YEL}FETCH FAILED${RST} (could not clone AUR repo; NOT verified — do not upgrade on faith)"
+    echo
+    continue
+  fi
+  commit=$(git -C "$repo" rev-parse HEAD 2>/dev/null || echo "")
+  rm -rf "$repo/.git"
+  if [[ ! -f "$repo/PKGBUILD" ]]; then
+    echo "${BOLD}${base}${RST} — ${RED}NO PKGBUILD${RST} in AUR repo (empty/deleted?) — NOT verified"
+    echo
+    flagged_count=$((flagged_count+1))
+    continue
+  fi
+
+  # ------------------------------------------------ diff vs baseline
+  changed=0 first_seen=0
+  if [[ -d "$pkg_cache/current" ]]; then
+    diff -rq "$pkg_cache/current" "$repo" >/dev/null 2>&1 || { changed=1; changed_count=$((changed_count+1)); }
+  else
+    first_seen=1
+  fi
+
+  # ------------------------------------------------ scan every file
+  hits_high=() hits_med=()
+  for pat in "${PATTERNS_HIGH[@]}"; do
+    while IFS= read -r line; do
+      hits_high+=("${line:0:160}")
+    done < <(grep -rinE "$pat" "$repo" 2>/dev/null | sed "s|^$repo/||" | head -4 || true)
+  done
+  for pat in "${PATTERNS_MED[@]}"; do
+    while IFS= read -r line; do
+      hits_med+=("${line:0:160}")
+    done < <(grep -rinE "$pat" "$repo" 2>/dev/null | sed "s|^$repo/||" | head -4 || true)
+  done
+
+  # binary files committed straight into the AUR repo
+  while IFS= read -r -d '' f; do
+    [[ -s "$f" ]] || continue
+    if ! grep -qI '' "$f"; then
+      hits_med+=("$(basename "$f"): binary file committed to AUR repo ($(stat -c%s "$f") bytes)")
+    fi
+  done < <(find "$repo" -type f -print0)
+
+  # long base64-ish lines = likely obfuscated payload
+  while IFS= read -r line; do
+    hits_med+=("${line%%:*}: base64-like blob >200 chars (possible obfuscated payload)")
+  done < <(grep -rlnE '[A-Za-z0-9+/=]{200,}' "$repo" 2>/dev/null | sed "s|^$repo/||" | head -3 || true)
+
+  # SKIP checksums on a non-VCS package
+  if grep -qE "^[a-z0-9]*sums(_[a-z0-9_]+)?=.*SKIP" "$repo/PKGBUILD" 2>/dev/null; then
+    if [[ "$base" != *-git && "$base" != *-svn && "$base" != *-hg && "$base" != *-bzr ]] \
+       && ! grep -qE 'source.*=.*(git\+|svn\+|hg\+|bzr\+)' "$repo/PKGBUILD"; then
+      hits_med+=("PKGBUILD: checksum SKIP on non-VCS package — source integrity unverified")
+    fi
+  fi
+
+  # ---------------------------------- upstream check (a): silent artifact swap
+  # Fingerprints: pkgver, raw source arrays, and the set of hex checksums.
+  # Same version + same sources + different checksums = the upstream file
+  # changed underneath a URL that looks identical. No honest reason for that.
+  pb_load_vars "$repo/PKGBUILD"
+  cur_pkgver="${PBVARS[pkgver]:-}"
+  cur_srcfp=$(awk '/^source(_[a-z0-9_]+)?=\(/{f=1} f{print; if (/\)/) f=0}' \
+    "$repo/PKGBUILD" | md5sum | cut -d' ' -f1)
+  cur_sumsfp=$({ grep -howE '[a-f0-9]{128}|[a-f0-9]{64}|[a-f0-9]{40}|[a-f0-9]{32}' \
+    "$repo/PKGBUILD" 2>/dev/null || true; } | sort | md5sum | cut -d' ' -f1)
+  if [[ -f "$pkg_cache/meta.json" ]]; then
+    prev_pkgver=$(jq -r '.pkgver // ""' "$pkg_cache/meta.json")
+    prev_srcfp=$(jq -r '.srcfp // ""' "$pkg_cache/meta.json")
+    prev_sumsfp=$(jq -r '.sumsfp // ""' "$pkg_cache/meta.json")
+    if [[ -n "$prev_pkgver" && "$prev_pkgver" == "$cur_pkgver" \
+          && -n "$prev_srcfp" && "$prev_srcfp" == "$cur_srcfp" \
+          && -n "$prev_sumsfp" && "$prev_sumsfp" != "$cur_sumsfp" ]]; then
+      hits_high+=("PKGBUILD: checksums CHANGED while pkgver and sources stayed identical — upstream artifact silently replaced")
+    fi
+  fi
+
+  # new source domains vs last run
+  new_domains=""
+  cur_domains=$(grep -rhoE '(https?|git|ftp)://[^"'"'"' )(]+' "$repo" 2>/dev/null \
+    | sed -E 's#^[a-z+]+://##; s#[/:].*##' | sort -u || true)
+  if [[ -f "$pkg_cache/domains.txt" && -n "$cur_domains" ]]; then
+    new_domains=$(comm -13 "$pkg_cache/domains.txt" <(printf '%s\n' "$cur_domains") | tr '\n' ' ')
+    [[ -n "${new_domains// /}" ]] \
+      && risk_notes+=("NEW source/URL domain(s) since last check: ${new_domains}— verify these are legit upstream")
+  fi
+
+  # -------------------- upstream checks (b)(c)(d): only when something is new
+  if [[ $has_update -eq 1 || $changed -eq 1 || $first_seen -eq 1 ]]; then
+    hp_dom=""
+    [[ "$homepage" != "null" && -n "$homepage" ]] \
+      && hp_dom=$(sed -E 's#^[a-z+]+://##; s#[/:].*##' <<< "$homepage")
+    gh_api_failed=0
+    n_checked=0
+    while IFS= read -r url; do
+      [[ -n "$url" ]] || continue
+      n_checked=$((n_checked+1)); [[ $n_checked -gt 3 ]] && break
+
+      # (d) source domain matches neither homepage nor known hosting —
+      # report only when first seen, so it doesn't nag on every run
+      dom=$(sed -E 's#^https?://##; s#[/:].*##' <<< "$url")
+      if [[ $first_seen -eq 1 || " $new_domains" == *" $dom "* || " $new_domains" == *" ${dom} "* ]]; then
+        rd=$(regdom "$dom"); known=0
+        for kh in "${KNOWN_HOSTS[@]}"; do [[ "$rd" == "$kh" ]] && known=1 && break; done
+        [[ -n "$hp_dom" && "$rd" == "$(regdom "$hp_dom")" ]] && known=1
+        [[ $known -eq 0 ]] \
+          && risk_notes+=("source domain '$dom' matches neither homepage (${hp_dom:-none}) nor known hosting — verify it's the real upstream")
+      fi
+
+      if [[ "$url" =~ ^https://github\.com/([^/]+)/([^/]+)/releases/download/([^/]+)/(.+)$ ]]; then
+        gh_owner="${BASH_REMATCH[1]}" gh_repo="${BASH_REMATCH[2]}"
+        gh_tag="${BASH_REMATCH[3]}" gh_asset="${BASH_REMATCH[4]}"
+        key=$(printf '%s' "$gh_owner/$gh_repo/$gh_tag" | md5sum | cut -d' ' -f1)
+        rel_json="$tmp_root/gh_$key.json"
+        if [[ ! -e "$rel_json" ]]; then
+          curl -fsS --max-time 15 -H "Accept: application/vnd.github+json" \
+            ${GITHUB_TOKEN:+-H "Authorization: Bearer $GITHUB_TOKEN"} \
+            "https://api.github.com/repos/$gh_owner/$gh_repo/releases/tags/$gh_tag" \
+            -o "$rel_json" 2>/dev/null || : > "$rel_json"
+        fi
+        if [[ ! -s "$rel_json" ]]; then
+          gh_api_failed=1
+          continue
+        fi
+        # (b) asset modified after publication = post-release binary swap
+        tampered=$(jq -r --arg a "$gh_asset" \
+          '.assets[]? | select(.name==$a)
+           | select((.updated_at|fromdateiso8601) - (.created_at|fromdateiso8601) > 300)
+           | "created \(.created_at), modified \(.updated_at)"' "$rel_json" 2>/dev/null || true)
+        [[ -n "$tampered" ]] \
+          && hits_high+=("upstream: GitHub asset '$gh_asset' MODIFIED after publication ($tampered) — classic binary-swap signal")
+        # (c) cooling-off, from the release's publish time
+        pub_epoch=$(jq -r '.published_at // empty | fromdateiso8601' "$rel_json" 2>/dev/null || true)
+        if [[ -n "$pub_epoch" ]]; then
+          rel_age_h=$(( (now - pub_epoch) / 3600 ))
+          [[ $rel_age_h -lt $COOLOFF_HOURS ]] \
+            && risk_notes+=("upstream release '$gh_tag' is only ${rel_age_h}h old (<${COOLOFF_HOURS}h cool-off) — consider waiting before upgrading")
+        fi
+      else
+        # (c) cooling-off for non-GitHub sources, via Last-Modified header
+        lm=$(curl -fsSIL --max-time 10 "$url" 2>/dev/null | tr -d '\r' \
+          | grep -i '^last-modified:' | tail -1 | cut -d' ' -f2- || true)
+        if [[ -n "$lm" ]]; then
+          lm_epoch=$(date -d "$lm" +%s 2>/dev/null || echo "")
+          if [[ -n "$lm_epoch" ]]; then
+            art_age_h=$(( (now - lm_epoch) / 3600 ))
+            [[ $art_age_h -ge 0 && $art_age_h -lt $COOLOFF_HOURS ]] \
+              && risk_notes+=("upstream artifact $(basename "$url") is only ${art_age_h}h old (<${COOLOFF_HOURS}h cool-off) — consider waiting before upgrading")
+          fi
+        fi
+      fi
+    done < <(pb_source_urls "$repo/PKGBUILD")
+    [[ $gh_api_failed -eq 1 ]] \
+      && risk_notes+=("GitHub API query failed (rate limit?) — asset-tamper/cool-off checks skipped; set GITHUB_TOKEN to raise limits")
+  fi
+
+  suspicious=0
+  [[ ${#hits_high[@]} -gt 0 ]] && suspicious=1
+
+  # baseline update — NEVER for suspicious packages, so a re-run can't
+  # launder a flagged change into "unchanged"
+  if [[ $suspicious -eq 0 ]]; then
+    if [[ $changed -eq 1 ]]; then
+      rm -rf "$pkg_cache/prev"
+      mv "$pkg_cache/current" "$pkg_cache/prev"
+    fi
+    if [[ ! -d "$pkg_cache/current" ]]; then
+      cp -r "$repo" "$pkg_cache/current"
+    fi
+    printf '%s\n' "$cur_domains" > "$pkg_cache/domains.txt"
+    jq -n --arg m "$maintainer" --arg c "$commit" --argjson t "$now" \
+      --arg pv "$cur_pkgver" --arg sf "$cur_srcfp" --arg cf "$cur_sumsfp" \
+      '{maintainer:$m, commit:$c, verified_at:$t, pkgver:$pv, srcfp:$sf, sumsfp:$cf}' \
+      > "$pkg_cache/meta.json"
+  fi
+
+  # helper cache cross-check (TOCTOU: verify what will actually be built)
+  helper_notes=()
+  for hd in "$HOME/.cache/paru/clone/$base" "$HOME/.cache/yay/$base"; do
+    [[ -d "$hd/.git" ]] || continue
+    lh=$(git -C "$hd" rev-parse HEAD 2>/dev/null || echo "")
+    if [[ -n "$lh" && -n "$commit" && "$lh" != "$commit" ]]; then
+      helper_notes+=("helper clone $hd is at ${lh:0:12}, verified is ${commit:0:12} — helper may build UNVERIFIED content; refresh or inspect it")
+    fi
+  done
+
+  # ------------------------------------------------ report
+  status_line="${GRN}OK${RST}"
+  if [[ $suspicious -eq 1 ]]; then
+    status_line="${RED}SUSPICIOUS${RST}"
+    flagged_count=$((flagged_count+1))
+  elif [[ ${#hits_med[@]} -gt 0 || ${#risk_notes[@]} -gt 0 || ${#helper_notes[@]} -gt 0 ]]; then
+    status_line="${YEL}WATCH${RST}"
+  fi
+
+  echo "${BOLD}${base}${RST} — ${status_line}  (votes:${votes} pop:${popularity} maintainer:${maintainer} commit:${commit:0:12})"
+  [[ -n "$upgrade_note" ]] && echo "  ↳ $upgrade_note"
+  [[ $changed -eq 1 ]] && echo "  ${YEL}↳ repo changed since last verified run — review: aur-verify --diff $base${RST}"
+  [[ $first_seen -eq 1 ]] && echo "  (baseline saved — future runs will diff against this)"
+  for note in "${risk_notes[@]}"; do echo "  ${YEL}↳ $note${RST}"; done
+  for note in "${helper_notes[@]}"; do echo "  ${YEL}↳ $note${RST}"; done
+  for hit in "${hits_high[@]}"; do echo "  ${RED}↳ $hit${RST}"; done
+  for hit in "${hits_med[@]}"; do echo "  ${YEL}↳ $hit${RST}"; done
+  [[ $suspicious -eq 1 ]] && echo "  ${RED}↳ baseline NOT updated for this package until it comes back clean${RST}"
+  echo
+done
+
+echo "${BOLD}Summary:${RST} ${flagged_count} flagged suspicious, ${changed_count} changed since last run."
+if [[ $flagged_count -gt 0 ]]; then
+  echo "${RED}Do not blindly upgrade flagged packages — actually open the PKGBUILD for those.${RST}"
+  exit 1
+fi
+exit 0
