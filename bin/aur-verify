@@ -132,6 +132,7 @@ pb_load_vars() { # $1 = PKGBUILD path
   while IFS= read -r line; do
     k=${line%%=*}; v=${line#*=}
     v=${v%\"}; v=${v#\"}; v=${v%\'}; v=${v#\'}
+    # shellcheck disable=SC2016 # intentional: matching literal $( / ` in the value, not expanding
     [[ "$v" == *'$('* || "$v" == *'`'* ]] && continue
     PBVARS[$k]=$v
   done < <(grep -E "^[A-Za-z_][A-Za-z0-9_]*=[^ ()]*$" "$1" 2>/dev/null || true)
