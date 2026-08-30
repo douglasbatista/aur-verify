@@ -1,5 +1,7 @@
 # aur-verify
 
+[![ShellCheck](https://github.com/douglasbatista/aur-verify/actions/workflows/shellcheck.yml/badge.svg)](https://github.com/douglasbatista/aur-verify/actions/workflows/shellcheck.yml)
+
 A heuristic safety check for installed AUR packages, built in response to the
 2024/2025 AUR supply-chain incidents (malicious PKGBUILDs, orphan takeovers,
 and swapped upstream release binaries).
